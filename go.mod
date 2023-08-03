@@ -4,7 +4,7 @@ go 1.17
 
 replace github.com/attestantio/go-eth2-client v0.15.7 => github.com/gnosischain/go-eth2-client v0.0.0-20230803220918-d35ee0a2d66b
 
-replace github.com/ethpandaops/beacon v0.25.0 => github.com/gnosischain/beacon v0.0.0-20230803221452-2bc31e4dca30
+replace github.com/ethpandaops/beacon v0.25.0 => github.com/gnosischain/beacon v0.0.0-20230803222300-e5ee3a99f02b
 
 require (
 	github.com/attestantio/go-eth2-client v0.15.7
