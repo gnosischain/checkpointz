@@ -2,6 +2,10 @@ module github.com/ethpandaops/checkpointz
 
 go 1.17
 
+replace github.com/attestantio/go-eth2-client v0.18.2 => github.com/gnosischain/go-eth2-client v0.0.0-20240201153140-5cca7bb1f497
+
+replace github.com/ethpandaops/beacon v0.28.0 => github.com/gnosischain/beacon v0.0.0-20230803222300-e5ee3a99f02b
+
 require (
 	github.com/attestantio/go-eth2-client v0.18.2
 	github.com/chuckpreslar/emission v0.0.0-20170206194824-a7ddd980baf9
