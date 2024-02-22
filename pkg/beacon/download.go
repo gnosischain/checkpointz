@@ -37,7 +37,7 @@ func (d *Default) downloadServingCheckpoint(ctx context.Context, checkpoint *v1.
 
 	// For simplicity we'll hardcode SLOTS_PER_EPOCH to 32.
 	// TODO(sam.calder-mason): Fetch this from a beacon node and store it in the instance.
-	const slotsPerEpoch = 32
+	const slotsPerEpoch = 16
 	if blockSlot%slotsPerEpoch != 0 {
 		return fmt.Errorf("block slot is not aligned from an epoch boundary: %d", blockSlot)
 	}
