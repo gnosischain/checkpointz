@@ -73,3 +73,7 @@ require (
 	gopkg.in/cenkalti/backoff.v1 v1.1.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/attestantio/go-eth2-client v0.19.9 => github.com/gnosischain/go-eth2-client v0.0.0-20240223183427-f035b187e6d1
+
+replace github.com/ethpandaops/beacon v0.35.0 => github.com/gnosischain/beacon v0.0.0-20240223190321-0dd001dcf505
