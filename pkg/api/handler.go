@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -198,6 +199,11 @@ func (h *Handler) handleEthV2BeaconBlocks(ctx context.Context, r *http.Request, 
 			ContentTypeJSON: block.Deneb.MarshalJSON,
 			ContentTypeSSZ:  block.Deneb.MarshalSSZ,
 		})
+	case spec.DataVersionElectra:
+		rsp = NewSuccessResponse(ContentTypeResolvers{
+			ContentTypeJSON: block.Electra.MarshalJSON,
+			ContentTypeSSZ:  block.Electra.MarshalSSZ,
+		})
 	default:
 		return NewInternalServerErrorResponse(nil), errors.New("unknown block version")
 	}
@@ -239,20 +245,37 @@ func (h *Handler) handleEthV2DebugBeaconStates(ctx context.Context, r *http.Requ
 
 	rsp := NewSuccessResponse(ContentTypeResolvers{
 		ContentTypeSSZ: func() ([]byte, error) {
-			return *state, nil
+			switch state.Version {
+			case spec.DataVersionPhase0:
+				return state.Phase0.MarshalSSZ()
+			case spec.DataVersionAltair:
+				return state.Altair.MarshalSSZ()
+			case spec.DataVersionBellatrix:
+				return state.Bellatrix.MarshalSSZ()
+			case spec.DataVersionCapella:
+				return state.Capella.MarshalSSZ()
+			case spec.DataVersionDeneb:
+				return state.Deneb.MarshalSSZ()
+			case spec.DataVersionElectra:
+				return state.Electra.MarshalSSZ()
+			default:
+				return nil, fmt.Errorf("unknown state version: %s", state.Version.String())
+			}
 		},
 	})
 
 	switch id.Type() {
-	case eth.StateIDRoot, eth.StateIDGenesis, eth.StateIDSlot:
-		// TODO(sam.calder-mason): This should be calculated using the Weak-Subjectivity period.
+	case eth.StateIDSlot:
 		rsp.SetCacheControl("public, s-max-age=6000")
 	case eth.StateIDFinalized:
-		// TODO(sam.calder-mason): This should be calculated using the Weak-Subjectivity period.
 		rsp.SetCacheControl("public, s-max-age=180")
+	case eth.StateIDRoot:
+		rsp.SetCacheControl("public, s-max-age=6000")
 	case eth.StateIDHead:
 		rsp.SetCacheControl("public, s-max-age=30")
 	}
+
+	rsp.SetEthConsensusVersion(state.Version.String())
 
 	return rsp, nil
 }
@@ -599,7 +622,21 @@ func (h *Handler) handleEthV1BeaconBlobSidecars(ctx context.Context, r *http.Req
 		return NewBadRequestResponse(nil), err
 	}
 
-	sidecars, err := h.eth.BlobSidecars(ctx, id)
+	queryParams := r.URL.Query()
+	indicesRaw := queryParams["indices"]
+
+	indices := make([]int, 0, len(indicesRaw))
+
+	for _, index := range indicesRaw {
+		converted, errr := strconv.Atoi(index)
+		if errr != nil {
+			return NewBadRequestResponse(nil), errr
+		}
+
+		indices = append(indices, converted)
+	}
+
+	sidecars, err := h.eth.BlobSidecars(ctx, id, indices)
 	if err != nil {
 		return NewInternalServerErrorResponse(nil), err
 	}

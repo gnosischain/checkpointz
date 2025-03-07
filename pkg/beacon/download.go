@@ -23,6 +23,21 @@ func (d *Default) downloadServingCheckpoint(ctx context.Context, checkpoint *v1.
 		return errors.New("finalized checkpoint is nil")
 	}
 
+	sp, err := d.Spec()
+	if err != nil {
+		return fmt.Errorf("failed to fetch spec: %w", err)
+	}
+
+	fork, err := sp.ForkEpochs.CurrentFork(checkpoint.Finalized.Epoch)
+	if err != nil {
+		return fmt.Errorf("failed to get current fork: %w", err)
+	}
+
+	d.log.
+		WithField("epoch", checkpoint.Finalized.Epoch).
+		WithField("fork_name", fork.Name).
+		Info("Downloading serving checkpoint")
+
 	upstream, err := d.nodes.
 		Ready(ctx).
 		DataProviders(ctx).
@@ -46,8 +61,8 @@ func (d *Default) downloadServingCheckpoint(ctx context.Context, checkpoint *v1.
 
 	// For simplicity we'll hardcode SLOTS_PER_EPOCH to 32.
 	// TODO(sam.calder-mason): Fetch this from a beacon node and store it in the instance.
-	const slotsPerEpoch = 16
-	if blockSlot%slotsPerEpoch != 0 {
+	// const slotsPerEpoch = 16
+	if blockSlot%sp.SlotsPerEpoch != 0 {
 		return fmt.Errorf("block slot is not aligned from an epoch boundary: %d", blockSlot)
 	}
 
@@ -129,8 +144,9 @@ func (d *Default) fetchHistoricalCheckpoints(ctx context.Context, checkpoint *v1
 	d.historicalMutex.Lock()
 	defer d.historicalMutex.Unlock()
 
-	if d.spec == nil {
-		return errors.New("beacon spec unavailable")
+	sp, err := d.Spec()
+	if err != nil {
+		return errors.New("chain spec unavailable")
 	}
 
 	if d.genesis == nil {
@@ -147,8 +163,6 @@ func (d *Default) fetchHistoricalCheckpoints(ctx context.Context, checkpoint *v1
 		return errors.New("no data provider node available")
 	}
 
-	sp := d.spec
-
 	slotsInScope := make(map[phase0.Slot]struct{})
 
 	// We always care about the genesis slot.
@@ -161,8 +175,9 @@ func (d *Default) fetchHistoricalCheckpoints(ctx context.Context, checkpoint *v1
 	// Calculate the epoch boundaries we need to fetch
 	// We'll derive the current finalized slot and then work back in intervals of SLOTS_PER_EPOCH.
 	currentSlot := uint64(checkpoint.Finalized.Epoch) * uint64(sp.SlotsPerEpoch)
-	for i := uint64(1); i < uint64(d.config.HistoricalEpochCount); i++ {
-		slot := phase0.Slot(currentSlot - i*uint64(sp.SlotsPerEpoch))
+	for i := 1; i < d.config.HistoricalEpochCount; i++ {
+		//nolint:gosec // This is not a security issue
+		slot := phase0.Slot(currentSlot - uint64(i)*uint64(sp.SlotsPerEpoch))
 		slotsInScope[slot] = struct{}{}
 	}
 
@@ -218,7 +233,8 @@ func (d *Default) downloadBlock(ctx context.Context, slot phase0.Slot, upstream 
 	}
 
 	// Same thing with the chain spec.
-	if d.spec == nil {
+	_, err := d.Spec()
+	if err != nil {
 		return nil, errors.New("chain spec not known")
 	}
 
@@ -285,7 +301,7 @@ func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *N
 		return nil, fmt.Errorf("failed to get state root from block: %w", err)
 	}
 
-	blockRoot, err := block.Root()
+	blockRoot, err := d.HashTreeRoot(block)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block root from block: %w", err)
 	}
@@ -317,23 +333,24 @@ func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *N
 		}
 	}
 
-	if slot != phase0.Slot(0) {
-		epoch := phase0.Epoch(slot / d.spec.SlotsPerEpoch)
+	sp, err := d.Spec()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch spec: %w", err)
+	}
 
+	epoch := phase0.Epoch(slot / sp.SlotsPerEpoch)
+
+	if slot != phase0.Slot(0) {
 		// Download and store deposit snapshots
 		if err = d.downloadAndStoreDepositSnapshot(ctx, epoch, upstream); err != nil {
-			return nil, fmt.Errorf("failed to download and store deposit snapshot: %w", err)
+			d.log.WithError(err).
+				Warn("failed to download and store deposit snapshot")
 		}
 	}
 
-	sp, err := upstream.Beacon.Spec()
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch spec from upstream node: %w", err)
-	}
-
-	denebFork, err := sp.ForkEpochs.GetByName("DENEB")
+	denebFork, err := sp.ForkEpochs.GetByName("deneb")
 	if err == nil && denebFork != nil {
-		if denebFork.Active(slot, sp.SlotsPerEpoch) {
+		if denebFork.Active(epoch) {
 			// Download and store blob sidecars
 			if err := d.downloadAndStoreBlobSidecars(ctx, slot, upstream); err != nil {
 				return nil, fmt.Errorf("failed to download and store blob sidecars: %w", err)
@@ -341,7 +358,10 @@ func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *N
 		}
 	}
 
-	d.log.Infof("Successfully fetched bundle from %s", upstream.Config.Name)
+	d.log.WithFields(logrus.Fields{
+		"block_root": eth.RootAsString(root),
+		"state_root": eth.RootAsString(stateRoot),
+	}).Infof("Successfully fetched bundle from %s", upstream.Config.Name)
 
 	return block, nil
 }
@@ -353,7 +373,7 @@ func (d *Default) downloadAndStoreBeaconState(ctx context.Context, stateRoot pha
 		return nil
 	}
 
-	beaconState, err := node.Beacon.FetchRawBeaconState(ctx, eth.SlotAsString(slot), "application/octet-stream")
+	beaconState, err := node.Beacon.FetchBeaconState(ctx, eth.SlotAsString(slot))
 	if err != nil {
 		return fmt.Errorf("failed to fetch beacon state: %w", err)
 	}
@@ -367,7 +387,7 @@ func (d *Default) downloadAndStoreBeaconState(ctx context.Context, stateRoot pha
 		expiresAt = time.Now().Add(999999 * time.Hour)
 	}
 
-	if err := d.states.Add(stateRoot, &beaconState, expiresAt, slot); err != nil {
+	if err := d.states.Add(stateRoot, beaconState, expiresAt, slot); err != nil {
 		return fmt.Errorf("failed to store beacon state: %w", err)
 	}
 

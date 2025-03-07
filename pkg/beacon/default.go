@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
+	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/deneb"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
@@ -21,7 +23,9 @@ import (
 	"github.com/ethpandaops/checkpointz/pkg/eth"
 	"github.com/ethpandaops/ethwallclock"
 	"github.com/go-co-op/gocron"
+	dynssz "github.com/pk910/dynamic-ssz"
 	perrors "github.com/pkg/errors"
+	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
 )
 
@@ -41,8 +45,9 @@ type Default struct {
 	depositSnapshots *store.DepositSnapshot
 	blobSidecars     *store.BlobSidecar
 
-	spec    *state.Spec
-	genesis *v1.Genesis
+	specMutex sync.Mutex
+	spec      *state.Spec
+	genesis   *v1.Genesis
 
 	historicalSlotFailures map[phase0.Slot]int
 
@@ -51,6 +56,9 @@ type Default struct {
 	majorityMutex   sync.Mutex
 
 	metrics *Metrics
+
+	dynSsz      *dynssz.DynSsz
+	dynSszMutex sync.Mutex
 }
 
 var _ FinalityProvider = (*Default)(nil)
@@ -86,6 +94,7 @@ func NewDefaultProvider(namespace string, log logrus.FieldLogger, nodes []node.C
 		servingMutex:    sync.Mutex{},
 		historicalMutex: sync.Mutex{},
 		majorityMutex:   sync.Mutex{},
+		specMutex:       sync.Mutex{},
 
 		metrics: NewMetrics(namespace + "_beacon"),
 	}
@@ -103,7 +112,7 @@ func (d *Default) Start(ctx context.Context) error {
 	go func() {
 		for {
 			// Wait until we have a single healthy node.
-			_, err := d.nodes.Healthy(ctx).NotSyncing(ctx).RandomNode(ctx)
+			nd, err := d.nodes.Healthy(ctx).NotSyncing(ctx).RandomNode(ctx)
 			if err != nil {
 				d.log.WithError(err).Error("Waiting for a healthy, non-syncing node before beginning..")
 				time.Sleep(time.Second * 5)
@@ -111,8 +120,26 @@ func (d *Default) Start(ctx context.Context) error {
 				continue
 			}
 
+			nd.Beacon.Wallclock().OnEpochChanged(func(epoch ethwallclock.Epoch) {
+				// Refresh the spec on epoch change.
+				// This will intentionally use any node (not the one that triggered the event) to fetch the spec.
+				if err := d.refreshSpec(ctx); err != nil {
+					d.log.WithError(err).Error("Failed to refresh spec")
+				}
+			})
+
 			if err := d.startCrons(ctx); err != nil {
 				d.log.WithError(err).Fatal("Failed to start crons")
+			}
+
+			go func() {
+				if err := d.startGenesisLoop(ctx); err != nil {
+					d.log.WithError(err).Fatal("Failed to start genesis loop")
+				}
+			}()
+
+			if err := d.fetchUpstreamRequirements(ctx); err != nil {
+				d.log.WithError(err).Error("Failed to fetch upstream requirements")
 			}
 
 			break
@@ -124,7 +151,8 @@ func (d *Default) Start(ctx context.Context) error {
 		n := node
 
 		logCtx := d.log.WithFields(logrus.Fields{
-			"node": n.Config.Name,
+			"node":   n.Config.Name,
+			"reason": "serving_updater",
 		})
 
 		n.Beacon.OnFinalityCheckpointUpdated(ctx, func(ctx context.Context, event *beacon.FinalityCheckpointUpdated) error {
@@ -140,7 +168,13 @@ func (d *Default) Start(ctx context.Context) error {
 				return err
 			}
 
-			return d.checkForNewServingCheckpoint(ctx)
+			if err := d.checkForNewServingCheckpoint(ctx); err != nil {
+				logCtx.WithError(err).Error("Failed to check for new serving checkpoint after finality checkpoint updated")
+
+				return err
+			}
+
+			return nil
 		})
 
 		n.Beacon.OnReady(ctx, func(ctx context.Context, _ *beacon.ReadyEvent) error {
@@ -197,12 +231,6 @@ func (d *Default) startCrons(ctx context.Context) error {
 	}
 
 	go func() {
-		if err := d.startGenesisLoop(ctx); err != nil {
-			d.log.WithError(err).Fatal("Failed to start genesis loop")
-		}
-	}()
-
-	go func() {
 		if err := d.startServingLoop(ctx); err != nil {
 			d.log.WithError(err).Fatal("Failed to start serving loop")
 		}
@@ -215,6 +243,14 @@ func (d *Default) startCrons(ctx context.Context) error {
 	}()
 
 	s.StartAsync()
+
+	return nil
+}
+
+func (d *Default) fetchUpstreamRequirements(ctx context.Context) error {
+	if err := d.refreshSpec(ctx); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -369,7 +405,7 @@ func (d *Default) Syncing(ctx context.Context) (*v1.SyncState, error) {
 		SyncDistance: 0,
 	}
 
-	sp, err := d.Spec(ctx)
+	sp, err := d.Spec()
 	if err != nil {
 		return syncState, err
 	}
@@ -405,12 +441,90 @@ func (d *Default) Genesis(ctx context.Context) (*v1.Genesis, error) {
 	return d.genesis, nil
 }
 
-func (d *Default) Spec(ctx context.Context) (*state.Spec, error) {
+func (d *Default) setSpec(s *state.Spec) {
+	d.specMutex.Lock()
+	defer d.specMutex.Unlock()
+
+	d.spec = s
+}
+
+func (d *Default) setDynSsz(dynSsz *dynssz.DynSsz) {
+	d.dynSszMutex.Lock()
+	defer d.dynSszMutex.Unlock()
+
+	d.dynSsz = dynSsz
+}
+
+func (d *Default) Spec() (*state.Spec, error) {
+	d.specMutex.Lock()
+	defer d.specMutex.Unlock()
+
 	if d.spec == nil {
 		return nil, errors.New("config spec not yet available")
 	}
 
-	return d.spec, nil
+	copied := *d.spec
+
+	return &copied, nil
+}
+
+func (d *Default) NewDynSsz() (*dynssz.DynSsz, error) {
+	ctx := context.Background()
+
+	for _, node := range d.nodes {
+		if !node.Beacon.Status().Healthy() {
+			continue
+		}
+
+		client, err := http.New(ctx, http.WithAddress(node.Config.Address), http.WithLogLevel(zerolog.Disabled))
+		if err != nil {
+			continue
+		}
+
+		spec, err := client.(*http.Service).Spec(ctx, &api.SpecOpts{})
+		if err != nil {
+			continue
+		}
+
+		return dynssz.NewDynSsz(spec.Data), nil
+	}
+
+	return nil, errors.New("no healthy nodes")
+}
+
+func (d *Default) DynSsz() (*dynssz.DynSsz, error) {
+	d.dynSszMutex.Lock()
+	defer d.dynSszMutex.Unlock()
+
+	if d.dynSsz == nil {
+		return nil, errors.New("DynSsz spec not yet available")
+	}
+
+	return d.dynSsz, nil
+}
+
+func (d *Default) HashTreeRoot(block *spec.VersionedSignedBeaconBlock) ([32]byte, error) {
+	ssz, err := d.DynSsz()
+	if err != nil {
+		return [32]byte{}, err
+	}
+
+	switch block.Version {
+	case spec.DataVersionPhase0:
+		return ssz.HashTreeRoot(block.Phase0.Message)
+	case spec.DataVersionAltair:
+		return ssz.HashTreeRoot(block.Altair.Message)
+	case spec.DataVersionBellatrix:
+		return ssz.HashTreeRoot(block.Bellatrix.Message)
+	case spec.DataVersionCapella:
+		return ssz.HashTreeRoot(block.Capella.Message)
+	case spec.DataVersionDeneb:
+		return ssz.HashTreeRoot(block.Deneb.Message)
+	case spec.DataVersionElectra:
+		return ssz.HashTreeRoot(block.Electra.Message)
+	default:
+		return [32]byte{}, errors.New("unknown version")
+	}
 }
 
 func (d *Default) OperatingMode() OperatingMode {
@@ -460,12 +574,7 @@ func (d *Default) checkFinality(ctx context.Context) error {
 	return nil
 }
 
-func (d *Default) checkBeaconSpec(ctx context.Context) error {
-	// No-Op if we already have a beacon spec
-	if d.spec != nil {
-		return nil
-	}
-
+func (d *Default) refreshSpec(ctx context.Context) error {
 	d.log.Debug("Fetching beacon spec")
 
 	upstream, err := d.nodes.Ready(ctx).DataProviders(ctx).RandomNode(ctx)
@@ -478,12 +587,28 @@ func (d *Default) checkBeaconSpec(ctx context.Context) error {
 		return err
 	}
 
-	// store the beacon state spec
-	d.spec = s
+	dynSsz, err := d.NewDynSsz()
+	if err != nil {
+		return err
+	}
 
-	d.log.Info("Fetched beacon spec")
+	// store the beacon state spec
+	d.setSpec(s)
+	d.setDynSsz(dynSsz)
+
+	d.log.Debug("Fetched beacon spec")
 
 	return nil
+}
+
+func (d *Default) checkBeaconSpec(ctx context.Context) error {
+	// No-Op if we already have a beacon spec
+	_, err := d.Spec()
+	if err == nil {
+		return nil
+	}
+
+	return d.refreshSpec(ctx)
 }
 
 func (d *Default) checkGenesisTime(ctx context.Context) error {
@@ -520,7 +645,7 @@ func (d *Default) OnFinalityCheckpointHeadUpdated(ctx context.Context, cb func(c
 	})
 }
 
-func (d *Default) publishFinalityCheckpointHeadUpdated(ctx context.Context, checkpoint *v1.Finality) {
+func (d *Default) publishFinalityCheckpointHeadUpdated(_ context.Context, checkpoint *v1.Finality) {
 	d.broker.Emit(topicFinalityHeadUpdated, checkpoint)
 }
 
@@ -567,7 +692,7 @@ func (d *Default) GetBlobSidecarsBySlot(ctx context.Context, slot phase0.Slot) (
 	return d.blobSidecars.GetBySlot(slot)
 }
 
-func (d *Default) GetBeaconStateBySlot(ctx context.Context, slot phase0.Slot) (*[]byte, error) {
+func (d *Default) GetBeaconStateBySlot(ctx context.Context, slot phase0.Slot) (*spec.VersionedBeaconState, error) {
 	block, err := d.GetBlockBySlot(ctx, slot)
 	if err != nil {
 		return nil, err
@@ -581,11 +706,11 @@ func (d *Default) GetBeaconStateBySlot(ctx context.Context, slot phase0.Slot) (*
 	return d.states.GetByStateRoot(stateRoot)
 }
 
-func (d *Default) GetBeaconStateByStateRoot(ctx context.Context, stateRoot phase0.Root) (*[]byte, error) {
+func (d *Default) GetBeaconStateByStateRoot(ctx context.Context, stateRoot phase0.Root) (*spec.VersionedBeaconState, error) {
 	return d.states.GetByStateRoot(stateRoot)
 }
 
-func (d *Default) GetBeaconStateByRoot(ctx context.Context, root phase0.Root) (*[]byte, error) {
+func (d *Default) GetBeaconStateByRoot(ctx context.Context, root phase0.Root) (*spec.VersionedBeaconState, error) {
 	block, err := d.GetBlockByRoot(ctx, root)
 	if err != nil {
 		return nil, err
@@ -599,11 +724,7 @@ func (d *Default) GetBeaconStateByRoot(ctx context.Context, root phase0.Root) (*
 	return d.states.GetByStateRoot(stateRoot)
 }
 
-func (d *Default) storeBlock(ctx context.Context, block *spec.VersionedSignedBeaconBlock) error {
-	if d.spec == nil {
-		return errors.New("beacon chain spec is unknown")
-	}
-
+func (d *Default) storeBlock(_ context.Context, block *spec.VersionedSignedBeaconBlock) error {
 	if d.genesis == nil {
 		return errors.New("genesis time is unknown")
 	}
@@ -612,7 +733,7 @@ func (d *Default) storeBlock(ctx context.Context, block *spec.VersionedSignedBea
 		return errors.New("block is nil")
 	}
 
-	root, err := block.Root()
+	root, err := d.HashTreeRoot(block)
 	if err != nil {
 		return err
 	}
@@ -651,7 +772,6 @@ func (d *Default) UpstreamsStatus(ctx context.Context) (map[string]*UpstreamStat
 
 		rsp[node.Config.Name].Healthy = node.Beacon.Status().Healthy()
 
-		//nolint:gocritic // invalid
 		if spec, err := node.Beacon.Spec(); err == nil {
 			network := spec.ConfigName
 			if network == "" {
@@ -679,7 +799,9 @@ func (d *Default) UpstreamsStatus(ctx context.Context) (map[string]*UpstreamStat
 
 func (d *Default) ListFinalizedSlots(ctx context.Context) ([]phase0.Slot, error) {
 	slots := []phase0.Slot{}
-	if d.spec == nil {
+
+	sp, err := d.Spec()
+	if err != nil {
 		return slots, errors.New("no beacon chain spec available")
 	}
 
@@ -692,9 +814,10 @@ func (d *Default) ListFinalizedSlots(ctx context.Context) ([]phase0.Slot, error)
 		return slots, errors.New("no finalized checkpoint available")
 	}
 
-	latestSlot := phase0.Slot(uint64(finality.Finalized.Epoch) * uint64(d.spec.SlotsPerEpoch))
+	latestSlot := phase0.Slot(uint64(finality.Finalized.Epoch) * uint64(sp.SlotsPerEpoch))
 
-	for i, val := uint64(latestSlot), uint64(latestSlot)-uint64(d.spec.SlotsPerEpoch)*uint64(d.config.HistoricalEpochCount); i > val; i -= uint64(d.spec.SlotsPerEpoch) {
+	//nolint:gosec // This is not a security issue
+	for i, val := uint64(latestSlot), uint64(latestSlot)-uint64(sp.SlotsPerEpoch)*uint64(d.config.HistoricalEpochCount); i > val; i -= uint64(sp.SlotsPerEpoch) {
 		slots = append(slots, phase0.Slot(i))
 	}
 
@@ -702,7 +825,8 @@ func (d *Default) ListFinalizedSlots(ctx context.Context) ([]phase0.Slot, error)
 }
 
 func (d *Default) GetEpochBySlot(ctx context.Context, slot phase0.Slot) (phase0.Epoch, error) {
-	if d.spec == nil {
+	_, err := d.Spec()
+	if err != nil {
 		return phase0.Epoch(0), errors.New("no upstream beacon state spec available")
 	}
 
@@ -716,7 +840,8 @@ func (d *Default) PeerCount(ctx context.Context) (uint64, error) {
 func (d *Default) GetSlotTime(ctx context.Context, slot phase0.Slot) (eth.SlotTime, error) {
 	SlotTime := eth.SlotTime{}
 
-	if d.spec == nil {
+	_, err := d.Spec()
+	if err != nil {
 		return SlotTime, errors.New("no upstream beacon state spec available")
 	}
 
