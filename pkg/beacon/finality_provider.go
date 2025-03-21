@@ -10,6 +10,7 @@ import (
 	"github.com/ethpandaops/beacon/pkg/beacon/api/types"
 	"github.com/ethpandaops/beacon/pkg/beacon/state"
 	"github.com/ethpandaops/checkpointz/pkg/eth"
+	"github.com/ethpandaops/checkpointz/pkg/specblock"
 )
 
 // FinalityProvider is a provider of finality information.
@@ -37,11 +38,11 @@ type FinalityProvider interface {
 	// UpstreamsStatus returns the status of all the upstreams.
 	UpstreamsStatus(ctx context.Context) (map[string]*UpstreamStatus, error)
 	// GetBlockBySlot returns the block at the given slot.
-	GetBlockBySlot(ctx context.Context, slot phase0.Slot) (*spec.VersionedSignedBeaconBlock, error)
+	GetBlockBySlot(ctx context.Context, slot phase0.Slot) (*specblock.SpecBlock, error)
 	// GetBlockByRoot returns the block with the given root.
-	GetBlockByRoot(ctx context.Context, root phase0.Root) (*spec.VersionedSignedBeaconBlock, error)
+	GetBlockByRoot(ctx context.Context, root phase0.Root) (*specblock.SpecBlock, error)
 	// GetBlockByStateRoot returns the block with the given root.
-	GetBlockByStateRoot(ctx context.Context, root phase0.Root) (*spec.VersionedSignedBeaconBlock, error)
+	GetBlockByStateRoot(ctx context.Context, root phase0.Root) (*specblock.SpecBlock, error)
 	// GetBeaconStateBySlot returns the beacon sate with the given slot.
 	GetBeaconStateBySlot(ctx context.Context, slot phase0.Slot) (*spec.VersionedBeaconState, error)
 	// GetBeaconStateByStateRoot returns the beacon sate with the given state root.

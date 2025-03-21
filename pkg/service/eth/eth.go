@@ -11,6 +11,7 @@ import (
 	"github.com/ethpandaops/beacon/pkg/beacon/api/types"
 	"github.com/ethpandaops/beacon/pkg/beacon/state"
 	"github.com/ethpandaops/checkpointz/pkg/beacon"
+	"github.com/ethpandaops/checkpointz/pkg/specblock"
 	"github.com/ethpandaops/checkpointz/pkg/version"
 	"github.com/sirupsen/logrus"
 )
@@ -35,7 +36,7 @@ func NewHandler(log logrus.FieldLogger, beac beacon.FinalityProvider, namespace 
 }
 
 // BeaconBlock returns the beacon block for the given block ID.
-func (h *Handler) BeaconBlock(ctx context.Context, blockID BlockIdentifier) (*spec.VersionedSignedBeaconBlock, error) {
+func (h *Handler) BeaconBlock(ctx context.Context, blockID BlockIdentifier) (*specblock.SpecBlock, error) {
 	var err error
 
 	const call = "beacon_block"

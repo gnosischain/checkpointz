@@ -7,9 +7,9 @@ import (
 	"time"
 
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
-	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/checkpointz/pkg/eth"
+	"github.com/ethpandaops/checkpointz/pkg/specblock"
 	perrors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -106,15 +106,16 @@ func (d *Default) checkGenesis(ctx context.Context) error {
 		return err
 	}
 
-	genesisBlock, err := randomNode.Beacon.FetchBlock(ctx, "genesis")
+	beaconGenesisBlock, err := randomNode.Beacon.FetchBlock(ctx, "genesis")
 	if err != nil {
 		return err
 	}
 
-	if genesisBlock == nil {
+	if beaconGenesisBlock == nil {
 		return errors.New("invalid genesis block")
 	}
 
+	genesisBlock := specblock.NewSpecBlock(beaconGenesisBlock, d.DynSsz)
 	genesisBlockRoot, err := genesisBlock.Root()
 	if err != nil {
 		return err
@@ -225,7 +226,7 @@ func (d *Default) fetchHistoricalCheckpoints(ctx context.Context, checkpoint *v1
 	return nil
 }
 
-func (d *Default) downloadBlock(ctx context.Context, slot phase0.Slot, upstream *Node) (*spec.VersionedSignedBeaconBlock, error) {
+func (d *Default) downloadBlock(ctx context.Context, slot phase0.Slot, upstream *Node) (*specblock.SpecBlock, error) {
 	// If we don't know genesis time yet, don't bother fetching blocks as
 	// we won't be able to calculate an expiry.
 	if d.genesis == nil {
@@ -245,15 +246,16 @@ func (d *Default) downloadBlock(ctx context.Context, slot phase0.Slot, upstream 
 	}
 
 	// Download the block from our upstream.
-	block, err := upstream.Beacon.FetchBlock(ctx, eth.SlotAsString(slot))
+	beaconBlock, err := upstream.Beacon.FetchBlock(ctx, eth.SlotAsString(slot))
 	if err != nil {
 		return nil, err
 	}
 
-	if block == nil {
+	if beaconBlock == nil {
 		return nil, errors.New("invalid block")
 	}
 
+	block := specblock.NewSpecBlock(beaconBlock, d.DynSsz)
 	stateRoot, err := block.StateRoot()
 	if err != nil {
 		return nil, err
@@ -280,20 +282,22 @@ func (d *Default) downloadBlock(ctx context.Context, slot phase0.Slot, upstream 
 	return block, nil
 }
 
-func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *Node) (*spec.VersionedSignedBeaconBlock, error) {
+func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *Node) (*specblock.SpecBlock, error) {
 	d.log.Infof("Fetching bundle from node %s with root %#x", upstream.Config.Name, root)
 
 	block, err := d.blocks.GetByRoot(root)
 	if err != nil || block == nil {
 		// Download the block.
-		block, err = upstream.Beacon.FetchBlock(ctx, fmt.Sprintf("%#x", root))
+		beaconBlock, err := upstream.Beacon.FetchBlock(ctx, fmt.Sprintf("%#x", root))
 		if err != nil {
 			return nil, err
 		}
 
-		if block == nil {
+		if beaconBlock == nil {
 			return nil, errors.New("block is nil")
 		}
+
+		block = specblock.NewSpecBlock(beaconBlock, d.DynSsz)
 	}
 
 	stateRoot, err := block.StateRoot()

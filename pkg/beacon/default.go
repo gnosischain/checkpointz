@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/api"
 	v1 "github.com/attestantio/go-eth2-client/api/v1"
+	"github.com/attestantio/go-eth2-client/http"
 	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/deneb"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
@@ -19,9 +21,12 @@ import (
 	"github.com/ethpandaops/checkpointz/pkg/beacon/node"
 	"github.com/ethpandaops/checkpointz/pkg/beacon/store"
 	"github.com/ethpandaops/checkpointz/pkg/eth"
+	"github.com/ethpandaops/checkpointz/pkg/specblock"
 	"github.com/ethpandaops/ethwallclock"
 	"github.com/go-co-op/gocron"
+	dynssz "github.com/pk910/dynamic-ssz"
 	perrors "github.com/pkg/errors"
+	"github.com/rs/zerolog"
 	"github.com/sirupsen/logrus"
 )
 
@@ -52,6 +57,9 @@ type Default struct {
 	majorityMutex   sync.Mutex
 
 	metrics *Metrics
+
+	dynSsz      *dynssz.DynSsz
+	dynSszMutex sync.Mutex
 }
 
 var _ FinalityProvider = (*Default)(nil)
@@ -441,6 +449,13 @@ func (d *Default) setSpec(s *state.Spec) {
 	d.spec = s
 }
 
+func (d *Default) setDynSsz(dynSsz *dynssz.DynSsz) {
+	d.dynSszMutex.Lock()
+	defer d.dynSszMutex.Unlock()
+
+	d.dynSsz = dynSsz
+}
+
 func (d *Default) Spec() (*state.Spec, error) {
 	d.specMutex.Lock()
 	defer d.specMutex.Unlock()
@@ -514,8 +529,14 @@ func (d *Default) refreshSpec(ctx context.Context) error {
 		return err
 	}
 
+	dynSsz, err := d.NewDynSsz()
+	if err != nil {
+		return err
+	}
+
 	// store the beacon state spec
 	d.setSpec(s)
+	d.setDynSsz(dynSsz)
 
 	d.log.Debug("Fetched beacon spec")
 
@@ -570,7 +591,7 @@ func (d *Default) publishFinalityCheckpointHeadUpdated(_ context.Context, checkp
 	d.broker.Emit(topicFinalityHeadUpdated, checkpoint)
 }
 
-func (d *Default) GetBlockBySlot(ctx context.Context, slot phase0.Slot) (*spec.VersionedSignedBeaconBlock, error) {
+func (d *Default) GetBlockBySlot(ctx context.Context, slot phase0.Slot) (*specblock.SpecBlock, error) {
 	block, err := d.blocks.GetBySlot(slot)
 	if err != nil {
 		return nil, err
@@ -583,7 +604,7 @@ func (d *Default) GetBlockBySlot(ctx context.Context, slot phase0.Slot) (*spec.V
 	return block, nil
 }
 
-func (d *Default) GetBlockByRoot(ctx context.Context, root phase0.Root) (*spec.VersionedSignedBeaconBlock, error) {
+func (d *Default) GetBlockByRoot(ctx context.Context, root phase0.Root) (*specblock.SpecBlock, error) {
 	block, err := d.blocks.GetByRoot(root)
 	if err != nil {
 		return nil, err
@@ -596,7 +617,7 @@ func (d *Default) GetBlockByRoot(ctx context.Context, root phase0.Root) (*spec.V
 	return block, nil
 }
 
-func (d *Default) GetBlockByStateRoot(ctx context.Context, stateRoot phase0.Root) (*spec.VersionedSignedBeaconBlock, error) {
+func (d *Default) GetBlockByStateRoot(ctx context.Context, stateRoot phase0.Root) (*specblock.SpecBlock, error) {
 	block, err := d.blocks.GetByStateRoot(stateRoot)
 	if err != nil {
 		return nil, err
@@ -645,7 +666,7 @@ func (d *Default) GetBeaconStateByRoot(ctx context.Context, root phase0.Root) (*
 	return d.states.GetByStateRoot(stateRoot)
 }
 
-func (d *Default) storeBlock(_ context.Context, block *spec.VersionedSignedBeaconBlock) error {
+func (d *Default) storeBlock(_ context.Context, block *specblock.SpecBlock) error {
 	_, err := d.Spec()
 	if err != nil {
 		return err
@@ -780,4 +801,39 @@ func (d *Default) GetSlotTime(ctx context.Context, slot phase0.Slot) (eth.SlotTi
 
 func (d *Default) GetDepositSnapshot(ctx context.Context, epoch phase0.Epoch) (*types.DepositSnapshot, error) {
 	return d.depositSnapshots.GetByEpoch(epoch)
+}
+
+func (d *Default) NewDynSsz() (*dynssz.DynSsz, error) {
+	ctx := context.Background()
+
+	for _, node := range d.nodes {
+		if !node.Beacon.Status().Healthy() {
+			continue
+		}
+
+		client, err := http.New(ctx, http.WithAddress(node.Config.Address), http.WithLogLevel(zerolog.Disabled))
+		if err != nil {
+			continue
+		}
+
+		spec, err := client.(*http.Service).Spec(ctx, &api.SpecOpts{})
+		if err != nil {
+			continue
+		}
+
+		return dynssz.NewDynSsz(spec.Data), nil
+	}
+
+	return nil, errors.New("no healthy nodes")
+}
+
+func (d *Default) DynSsz() (*dynssz.DynSsz, error) {
+	d.dynSszMutex.Lock()
+	defer d.dynSszMutex.Unlock()
+
+	if d.dynSsz == nil {
+		return nil, errors.New("DynSsz spec not yet available")
+	}
+
+	return d.dynSsz, nil
 }

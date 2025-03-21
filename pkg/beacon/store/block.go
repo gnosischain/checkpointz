@@ -5,10 +5,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/ethpandaops/checkpointz/pkg/cache"
 	"github.com/ethpandaops/checkpointz/pkg/eth"
+	"github.com/ethpandaops/checkpointz/pkg/specblock"
 	"github.com/sirupsen/logrus"
 )
 
@@ -32,7 +32,7 @@ func NewBlock(log logrus.FieldLogger, config Config, namespace string) *Block {
 	c.store.OnItemDeleted(func(key string, value interface{}, expiredAt time.Time) {
 		c.log.WithField("block_root", key).WithField("expired_at", expiredAt.String()).Debug("Block was evicted from the cache")
 
-		block, ok := value.(*spec.VersionedSignedBeaconBlock)
+		block, ok := value.(*specblock.SpecBlock)
 		if !ok {
 			c.log.WithField("block_root", key).Error("Invalid block type when cleaning up block cache")
 			return
@@ -48,7 +48,7 @@ func NewBlock(log logrus.FieldLogger, config Config, namespace string) *Block {
 	return c
 }
 
-func (c *Block) Add(block *spec.VersionedSignedBeaconBlock, expiresAt time.Time) error {
+func (c *Block) Add(block *specblock.SpecBlock, expiresAt time.Time) error {
 	root, err := block.Root()
 	if err != nil {
 		return err
@@ -87,7 +87,7 @@ func (c *Block) Add(block *spec.VersionedSignedBeaconBlock, expiresAt time.Time)
 	return nil
 }
 
-func (c *Block) cleanupBlock(block *spec.VersionedSignedBeaconBlock) error {
+func (c *Block) cleanupBlock(block *specblock.SpecBlock) error {
 	slot, err := block.Slot()
 	if err != nil {
 		return err
@@ -104,7 +104,7 @@ func (c *Block) cleanupBlock(block *spec.VersionedSignedBeaconBlock) error {
 	return nil
 }
 
-func (c *Block) GetByRoot(root phase0.Root) (*spec.VersionedSignedBeaconBlock, error) {
+func (c *Block) GetByRoot(root phase0.Root) (*specblock.SpecBlock, error) {
 	data, _, err := c.store.Get(eth.RootAsString(root))
 	if err != nil {
 		return nil, err
@@ -113,7 +113,7 @@ func (c *Block) GetByRoot(root phase0.Root) (*spec.VersionedSignedBeaconBlock, e
 	return c.parseBlock(data)
 }
 
-func (c *Block) GetByStateRoot(stateRoot phase0.Root) (*spec.VersionedSignedBeaconBlock, error) {
+func (c *Block) GetByStateRoot(stateRoot phase0.Root) (*specblock.SpecBlock, error) {
 	data, ok := c.stateRootToBlockRoot.Load(stateRoot)
 	if !ok {
 		return nil, errors.New("block not found")
@@ -127,7 +127,7 @@ func (c *Block) GetByStateRoot(stateRoot phase0.Root) (*spec.VersionedSignedBeac
 	return c.GetByRoot(root)
 }
 
-func (c *Block) GetBySlot(slot phase0.Slot) (*spec.VersionedSignedBeaconBlock, error) {
+func (c *Block) GetBySlot(slot phase0.Slot) (*specblock.SpecBlock, error) {
 	data, ok := c.slotToBlockRoot.Load(slot)
 	if !ok {
 		return nil, errors.New("block not found")
@@ -141,8 +141,8 @@ func (c *Block) GetBySlot(slot phase0.Slot) (*spec.VersionedSignedBeaconBlock, e
 	return c.GetByRoot(root)
 }
 
-func (c *Block) parseBlock(data interface{}) (*spec.VersionedSignedBeaconBlock, error) {
-	block, ok := data.(*spec.VersionedSignedBeaconBlock)
+func (c *Block) parseBlock(data interface{}) (*specblock.SpecBlock, error) {
+	block, ok := data.(*specblock.SpecBlock)
 	if !ok {
 		return nil, errors.New("invalid block type")
 	}
