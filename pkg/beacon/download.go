@@ -115,7 +115,7 @@ func (d *Default) checkGenesis(ctx context.Context) error {
 		return errors.New("invalid genesis block")
 	}
 
-	genesisBlockRoot, err := genesisBlock.Root()
+	genesisBlockRoot, err := d.sszEncoder.GetBlockRoot(genesisBlock)
 	if err != nil {
 		return err
 	}
@@ -176,8 +176,9 @@ func (d *Default) fetchHistoricalCheckpoints(ctx context.Context, checkpoint *v1
 		if uint64(i)*uint64(sp.SlotsPerEpoch) > currentSlot {
 			break
 		}
-		//nolint:gosec // This is not a security issue
+
 		slot := phase0.Slot(currentSlot - uint64(i)*uint64(sp.SlotsPerEpoch))
+
 		slotsInScope[slot] = struct{}{}
 	}
 
@@ -259,7 +260,7 @@ func (d *Default) downloadBlock(ctx context.Context, slot phase0.Slot, upstream 
 		return nil, err
 	}
 
-	root, err := block.Root()
+	root, err := d.sszEncoder.GetBlockRoot(block)
 	if err != nil {
 		return nil, err
 	}
@@ -301,13 +302,13 @@ func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *N
 		return nil, fmt.Errorf("failed to get state root from block: %w", err)
 	}
 
-	blockRoot, err := block.Root()
+	blockRoot, err := d.sszEncoder.GetBlockRoot(block)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get block root from block: %w", err)
 	}
 
 	if blockRoot != root {
-		return nil, errors.New("block root does not match")
+		return nil, fmt.Errorf("block root does not match: %#x != %#x", blockRoot, root)
 	}
 
 	slot, err := block.Slot()
@@ -351,9 +352,15 @@ func (d *Default) fetchBundle(ctx context.Context, root phase0.Root, upstream *N
 	denebFork, err := sp.ForkEpochs.GetByName("deneb")
 	if err == nil && denebFork != nil {
 		if denebFork.Active(epoch) {
-			// Download and store blob sidecars
-			if err := d.downloadAndStoreBlobSidecars(ctx, slot, upstream); err != nil {
-				return nil, fmt.Errorf("failed to download and store blob sidecars: %w", err)
+			// Check if Fulu is active - if so, don't fetch blobs as they're no longer in blocks
+			fuluFork, fuluErr := sp.ForkEpochs.GetByName("fulu")
+			if fuluErr == nil && fuluFork != nil && fuluFork.Active(epoch) {
+				d.log.WithField("epoch", epoch).Debug("Skipping blob sidecar download - Fulu fork active")
+			} else {
+				// Download and store blob sidecars
+				if err := d.downloadAndStoreBlobSidecars(ctx, slot, upstream); err != nil {
+					return nil, fmt.Errorf("failed to download and store blob sidecars: %w", err)
+				}
 			}
 		}
 	}

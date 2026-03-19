@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/ethpandaops/checkpointz/pkg/beacon"
+	"github.com/ethpandaops/checkpointz/pkg/beacon/ssz"
 	"github.com/ethpandaops/checkpointz/pkg/service/checkpointz"
 	"github.com/ethpandaops/checkpointz/pkg/service/eth"
 	"github.com/julienschmidt/httprouter"
@@ -26,6 +26,7 @@ type Handler struct {
 
 	eth           *eth.Handler
 	checkpointz   *checkpointz.Handler
+	sszEncoder    *ssz.Encoder
 	publicURL     string
 	brandName     string
 	brandImageURL string
@@ -39,6 +40,7 @@ func NewHandler(log logrus.FieldLogger, beac beacon.FinalityProvider, config *be
 
 		eth:           eth.NewHandler(log, beac, "checkpointz"),
 		checkpointz:   checkpointz.NewHandler(log, beac),
+		sszEncoder:    beac.SSZEncoder(),
 		publicURL:     config.Frontend.PublicURL,
 		brandName:     config.Frontend.BrandName,
 		brandImageURL: config.Frontend.BrandImageURL,
@@ -171,45 +173,18 @@ func (h *Handler) handleEthV2BeaconBlocks(ctx context.Context, r *http.Request, 
 		return NewInternalServerErrorResponse(nil), err
 	}
 
-	var rsp = &HTTPResponse{}
-
-	switch block.Version {
-	case spec.DataVersionPhase0:
-		rsp = NewSuccessResponse(ContentTypeResolvers{
-			ContentTypeJSON: block.Phase0.MarshalJSON,
-			ContentTypeSSZ:  block.Phase0.MarshalSSZ,
-		})
-	case spec.DataVersionAltair:
-		rsp = NewSuccessResponse(ContentTypeResolvers{
-			ContentTypeJSON: block.Altair.MarshalJSON,
-			ContentTypeSSZ:  block.Altair.MarshalSSZ,
-		})
-	case spec.DataVersionBellatrix:
-		rsp = NewSuccessResponse(ContentTypeResolvers{
-			ContentTypeJSON: block.Bellatrix.MarshalJSON,
-			ContentTypeSSZ:  block.Bellatrix.MarshalSSZ,
-		})
-	case spec.DataVersionCapella:
-		rsp = NewSuccessResponse(ContentTypeResolvers{
-			ContentTypeJSON: block.Capella.MarshalJSON,
-			ContentTypeSSZ:  block.Capella.MarshalSSZ,
-		})
-	case spec.DataVersionDeneb:
-		rsp = NewSuccessResponse(ContentTypeResolvers{
-			ContentTypeJSON: block.Deneb.MarshalJSON,
-			ContentTypeSSZ:  block.Deneb.MarshalSSZ,
-		})
-	case spec.DataVersionElectra:
-		rsp = NewSuccessResponse(ContentTypeResolvers{
-			ContentTypeJSON: block.Electra.MarshalJSON,
-			ContentTypeSSZ:  block.Electra.MarshalSSZ,
-		})
-	default:
-		return NewInternalServerErrorResponse(nil), errors.New("unknown block version")
-	}
+	rsp := NewSuccessResponse(ContentTypeResolvers{
+		ContentTypeJSON: func() ([]byte, error) {
+			return h.sszEncoder.EncodeBlockJSON(block)
+		},
+		ContentTypeSSZ: func() ([]byte, error) {
+			return h.sszEncoder.EncodeBlockSSZ(block)
+		},
+	})
 
 	rsp.AddExtraData("version", block.Version.String())
-	rsp.AddExtraData("execution_optimistic", "false")
+	rsp.AddExtraData("execution_optimistic", false)
+	rsp.AddExtraData("finalized", true) // We only serve finalized data
 
 	switch blockID.Type() {
 	case eth.BlockIDRoot, eth.BlockIDGenesis, eth.BlockIDSlot:
@@ -245,22 +220,7 @@ func (h *Handler) handleEthV2DebugBeaconStates(ctx context.Context, r *http.Requ
 
 	rsp := NewSuccessResponse(ContentTypeResolvers{
 		ContentTypeSSZ: func() ([]byte, error) {
-			switch state.Version {
-			case spec.DataVersionPhase0:
-				return state.Phase0.MarshalSSZ()
-			case spec.DataVersionAltair:
-				return state.Altair.MarshalSSZ()
-			case spec.DataVersionBellatrix:
-				return state.Bellatrix.MarshalSSZ()
-			case spec.DataVersionCapella:
-				return state.Capella.MarshalSSZ()
-			case spec.DataVersionDeneb:
-				return state.Deneb.MarshalSSZ()
-			case spec.DataVersionElectra:
-				return state.Electra.MarshalSSZ()
-			default:
-				return nil, fmt.Errorf("unknown state version: %s", state.Version.String())
-			}
+			return h.sszEncoder.EncodeStateSSZ(state)
 		},
 	})
 
@@ -636,7 +596,7 @@ func (h *Handler) handleEthV1BeaconBlobSidecars(ctx context.Context, r *http.Req
 		indices = append(indices, converted)
 	}
 
-	sidecars, err := h.eth.BlobSidecars(ctx, id, indices)
+	sidecars, dataVersion, err := h.eth.BlobSidecars(ctx, id, indices)
 	if err != nil {
 		return NewInternalServerErrorResponse(nil), err
 	}
@@ -646,6 +606,12 @@ func (h *Handler) handleEthV1BeaconBlobSidecars(ctx context.Context, r *http.Req
 			return json.Marshal(sidecars)
 		},
 	})
+
+	rsp.SetEthConsensusVersion(strings.ToLower(dataVersion.String()))
+
+	rsp.AddExtraData("version", strings.ToLower(dataVersion.String()))
+	rsp.AddExtraData("execution_optimistic", false)
+	rsp.AddExtraData("finalized", true) // We only serve finalized data
 
 	switch id.Type() {
 	case eth.BlockIDFinalized, eth.BlockIDRoot:
